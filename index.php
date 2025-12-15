@@ -1,82 +1,111 @@
 <?php
-require_once __DIR__ . '/../config.php';
+declare(strict_types=1);
+
+/*
+|--------------------------------------------------------------------------
+| Railway Trust Mint
+|--------------------------------------------------------------------------
+| - Verifies Cloudflare Turnstile
+| - Collects passive signals
+| - Issues short-lived opaque trust token
+| - No business logic
+| - No knowledge of main/VPS flow
+|--------------------------------------------------------------------------
+*/
 
 header('Content-Type: application/json');
+header('Cache-Control: no-store, no-cache, must-revalidate');
+header('Pragma: no-cache');
 
-$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if (!in_array($origin, ALLOWED_ORIGINS, true)) {
-    http_response_code(403);
-    echo json_encode(['ok' => false, 'error' => 'Unauthorized origin']);
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['ok' => false]);
     exit;
 }
 
-header("Access-Control-Allow-Origin: $origin");
-header("Access-Control-Allow-Credentials: true");
-header("Access-Control-Allow-Methods: POST, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type");
+/* =======================
+   CONFIG
+   ======================= */
+$SECRET        = getenv('TRUST_SECRET');
+$TOKEN_TTL     = (int)(getenv('TOKEN_TTL') ?: 300);
+$TURNSTILE_KEY = getenv('TURNSTILE_SECRET');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(204);
+if (!$SECRET || !$TURNSTILE_KEY) {
+    http_response_code(500);
+    echo json_encode(['ok' => false]);
     exit;
 }
 
-$action = $_POST['action'] ?? '';
+/* =======================
+   INPUT
+   ======================= */
+$turnstileToken = $_POST['cf_turnstile'] ?? '';
+$signalsRaw     = $_POST['signals'] ?? '';
 
-function json_ok($extra = []) { echo json_encode(array_merge(['ok' => true], $extra)); exit; }
-function json_fail($msg) { echo json_encode(['ok' => false, 'error' => $msg]); exit; }
-
-function generate_token($email = null) {
-    $ts = time();
-    $payload = [
-        'email' => $email ?? '',
-        'ts' => $ts
-    ];
-    $mac = hash_hmac('sha256', json_encode($payload), TOKEN_SECRET);
-    return base64_encode(json_encode(['payload'=>$payload,'mac'=>$mac]));
+if (!$turnstileToken) {
+    echo json_encode(['ok' => false]);
+    exit;
 }
 
-function parse_token($token) {
-    $decoded = base64_decode($token, true);
-    if (!$decoded) return [false, 'Invalid token'];
-    $data = json_decode($decoded, true);
-    if (!$data || !isset($data['payload'], $data['mac'])) return [false,'Malformed token'];
+/* =======================
+   TURNSTILE VERIFY
+   ======================= */
+$verify = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
+curl_setopt_array($verify, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => http_build_query([
+        'secret'   => $TURNSTILE_KEY,
+        'response' => $turnstileToken,
+        'remoteip' => $_SERVER['REMOTE_ADDR'] ?? null
+    ])
+]);
 
-    $expected = hash_hmac('sha256', json_encode($data['payload']), TOKEN_SECRET);
-    if (!hash_equals($expected, $data['mac'])) return [false,'Token verification failed'];
+$response = curl_exec($verify);
+curl_close($verify);
 
-    if (time() - $data['payload']['ts'] > TOKEN_TTL) return [false,'Token expired'];
+$result = json_decode($response, true);
 
-    return [true, $data['payload']];
+if (empty($result['success'])) {
+    echo json_encode(['ok' => false]);
+    exit;
 }
 
-// Rate limit by IP
-$ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-$rateFile = RATE_LIMIT_DIR . "/$ip.txt";
-if (!is_dir(RATE_LIMIT_DIR)) mkdir(RATE_LIMIT_DIR, 0755, true);
-$recent = file_exists($rateFile) ? file($rateFile, FILE_IGNORE_NEW_LINES) : [];
-$recent = array_filter($recent, fn($ts) => time() - (int)$ts < 60);
-if (count($recent) >= 5) {
-    http_response_code(429);
-    json_fail('Too many requests. Try again later.');
-}
-$recent[] = time();
-file_put_contents($rateFile, implode("\n", $recent));
-
-// ------------------ Actions -------------------
-if ($action === 'request_token') {
-    // Optional: capture honeypots / passive signals
-    $behavior = json_decode($_POST['behavior'] ?? '{}', true);
-
-    // Issue token
-    $token = generate_token();
-    json_ok(['token'=>$token]);
+/* =======================
+   PASSIVE SIGNAL PARSE
+   ======================= */
+$signals = json_decode($signalsRaw, true);
+if (!is_array($signals)) {
+    $signals = [];
 }
 
-if ($action === 'validate') {
-    $token = $_POST['token'] ?? '';
-    [$valid,$payload] = parse_token($token);
-    if (!$valid) json_fail($payload);
-    json_ok(['token'=>$token]);
-}
+/* Lightweight sanity only — NO blocking */
+$ua     = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 180);
+$lang   = substr($_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? '', 0, 64);
+$ip     = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
+$time   = time();
+$nonce  = bin2hex(random_bytes(8));
 
-json_fail('Invalid action');
+/* =======================
+   TOKEN BUILD (OPAQUE)
+   ======================= */
+$payload = [
+    't' => $time,
+    'n' => $nonce,
+    'i' => hash('sha256', $ip),
+    'u' => hash('sha256', $ua),
+];
+
+$raw  = base64_encode(json_encode($payload));
+$mac  = hash_hmac('sha256', $raw, $SECRET);
+$token = $raw . '.' . $mac;
+
+/* =======================
+   RESPONSE
+   ======================= */
+echo json_encode([
+    'ok'    => true,
+    'token' => $token,
+    'exp'   => $time + $TOKEN_TTL
+]);
+exit;
