@@ -1,17 +1,10 @@
-# Use official PHP image with Apache
 FROM php:8.2-apache
-
-# Enable required PHP extensions
-RUN docker-php-ext-install pdo pdo_mysql mbstring json
-
-# Copy backend files
-COPY . /var/www/html/
-
-# Set proper permissions
-RUN chown -R www-data:www-data /var/www/html/data
-
-# Expose port 80
+RUN a2enmod rewrite
+WORKDIR /var/www/html
+COPY . /var/www/html
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html \
+    && mkdir -p /var/www/html/.data /var/www/html/ogas
+RUN sed -i '/<Directory \/var\/www\/>/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/' /etc/apache2/apache2.conf
 EXPOSE 80
-
-# Start Apache
 CMD ["apache2-foreground"]
